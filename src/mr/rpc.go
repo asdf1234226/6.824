@@ -15,6 +15,7 @@ import "strconv"
 //
 
 type ExampleArgs struct {
+	//TODO
 	X int
 }
 
