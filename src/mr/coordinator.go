@@ -6,6 +6,7 @@ import "os"
 import "net/rpc"
 import "net/http"
 import "time"
+import "sync"
 
 type TaskType int
 const (
@@ -26,6 +27,8 @@ type Task struct {
 	TaskState  TaskState    
 	StartTime  time.Time
 	InputFile  []string    //一个file对应一个map，但是一个reduce可能要处理多个mr-X-Y中间的file
+	ReduceKth  int      //reduce函数输出文件名时需要，mr-X-Y, Y对应应该分到的reduce编号
+	ReduceNum  int
 }
 
 type Phase int
@@ -43,6 +46,7 @@ type Coordinator struct {
 	TaskMap               map[int]*Task  //记录所有的task
 	MapperNum             int      //每个文件分给一个map去做
 	ReduceNum             int      //传入的reducer数量，用于hash
+	mu                    sync.Mutex // 添加互斥锁来保护 TaskMap
 }
 
 func (c * Coordinator) GenerateTaskId() int {
@@ -59,18 +63,22 @@ func (c * Coordinator) GenerateTaskId() int {
 // }
 
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
+	c.mu.Lock()
+	defer mu.Unlock()
 	switch c.CurrentPhase {
 	case MapPhase:
 		if len(c.MapTaskChannel) > 0 {
 			taskp := <- c.MapTaskChannel
 			if taskp.TaskState == Waiting {
 				reply.Task = *taskp
+				reply.Answer = TaskGot
 				task.TaskState = Working
 				task.StartTime = time.Now()
 				c.TaskMap[*(taskp).TaskId] = taskp
 				fmt.Printf("Task[%d] has been assigned\n", taskp.TaskId)
 			}
 		} else {
+			reply.Answer = NoTaskNow
 			if c.checkMapTaskDone(){
 				c.toNextStage()
 			}
@@ -81,6 +89,7 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 		if len(c.ReduceTaskChannel) > 0 {
 			taskp := <- c.ReduceTaskChannel
 			if taskp.TaskState == Waiting {
+				reply.Answer = TaskGot
 				reply.Task = *taskp
 				task.TaskState = Working
 				task.StartTime = time.Now()
@@ -88,6 +97,7 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 				fmt.Printf("Task[%d] has been assigned\n", taskp.TaskId)
 			}
 		} else {
+			reply.Answer = NoTaskNow
 			if c.checkReduceTaskDone(){
 				c.toNextStage()
 			}
@@ -95,11 +105,21 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 		}
 	
 	case Done:
+		reply.Answer = Finish
 		fmt.Println("all task have been finishe")
 	
 	default:
 		fmt.Println("undefined phase")
 	}
+	return nil
+}
+
+func (c *Coordinator) UpdateTaskState(args *TaskArgs, reply *TaskReply) error{
+	c.mu.Lock()
+	defer mu.Unlock()
+	id := args.TaskId
+	fmt.Printf("Task[%d] has been finished\n", id)
+	c.TaskMap[id].TaskState = Finished
 	return nil
 }
 
@@ -167,9 +187,12 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	ret := false
 
-	// Your code here.
-
-
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	if c.CurrentPhase == Done{
+		ret = true
+	}
 	return ret
 }
 
@@ -178,13 +201,15 @@ func (c *Coordinator) MakeMapTask(files []string) {
 	log.Printf("begin to make map task\n")
 	for _, file := range files {
 		input := []string{file}
-		id := c.GenerateTaskId
+		id := c.GenerateTaskId()
 		mapTask := Task {
 			TaskId: id,
 			TaskType: MapTask,
 			TaskState: Waiting,
 			StartTime: time.Now(),
 			InputFile: input,
+			ReduceKth: -1,
+			ReduceNum: c.ReduceNum
 		}
 		log.Printf("make a map task for file: %s, task id: %d\n", file, id)
 		c.MapTaskChannel <- &mapTask
@@ -217,6 +242,8 @@ func (c *Coordinator) MakeReduceTask(){
 			TaskState: Waiting,
 			StartTime: time.Now(),
 			InputFile: input,
+			ReduceKth: i,
+			ReduceNum: c.ReduceNum,
 		}
 		log.Printf("make a map task for file: %s, task id: %d\n", file, id)
 		c.ReduceTaskChannel <- &reduceTask
@@ -244,5 +271,35 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	m.MakeMapTask(files)
 
 	c.server()
+
+	go c.CrashHandle()//探测并处理crash的协程
 	return &c
+}
+
+//如果worker发生crash（这里假定10秒没完成），会将这个任务重置，删除TaskMap的对应条，然后放入channel中等待下次分配
+func (c *Coordinator) CrashHandle() {
+    ticker := time.NewTicker(2 * time.Second)
+    for {
+        select {
+        case <-ticker.C:
+			if c.CurrentPhase == Done {
+				break;
+			}
+          	c.mu.Lock()
+			defer c.mu.Unlock()
+            for _, task := range c.TaskMap {
+				if task.TaskState == Working && time.Now() - task.StartTime > 10 {
+					fmt.Printf("Task[%d] is crashed\n", task.TaskId)
+					task.TaskState = Waiting //更新
+					switch task.TaskType {
+					case MapTask:
+						c.MapTaskChannel <- task
+					case ReduceTask:
+						c.ReduceTaskChannel <- task
+					}
+					delete(c.MakeMapTask, task.taskID)
+				}
+            }
+        }
+    }
 }

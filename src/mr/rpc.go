@@ -29,9 +29,28 @@ type TaskArgs struct {
 
 }
 
+//worker向master请求任务时，除了返回task，还应该返回task状态
+//分别为获取task成功； 暂没有未分配的task; 所有worker任务完成
+type ReplyState int
+const (
+	TaskGot    ReplyState = itoa
+	NoTaskNow
+	Finish
+)
+
 type TaskReply struct {
 	TaskReply Task
+	Answer    ReplyState
 }
+
+//worker完成后告知master更新任务状态，master去修改TaskMap中的任务状态
+type FinArgs struct {
+	TaskId int
+}
+type FinReply struct {
+
+}
+
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
