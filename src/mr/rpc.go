@@ -15,7 +15,6 @@ import "strconv"
 //
 
 type ExampleArgs struct {
-	//TODO
 	X int
 }
 
@@ -25,6 +24,14 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+//rpc请求传入参数，只是worker获取一个Task，不需要参数
+type TaskArgs struct {
+
+}
+
+type TaskReply struct {
+	TaskReply Task
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

@@ -44,7 +44,6 @@ func Worker(mapf func(string, string) []KeyValue,
 // the RPC argument and reply types are defined in rpc.go.
 //
 func CallExample() {
-
 	// declare an argument structure.
 	args := ExampleArgs{}
 
@@ -67,11 +66,19 @@ func CallExample() {
 	}
 }
 
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
+//向master发起RPC请求，获取task
+func CallTask() TaskReply {
+	args := TaskArgs{}
+	reply := TaskReply{}
+
+	ok := call("Coordinator.AssignTask", &args, &reply)
+	if !ok {
+		fmt.Println("call rpc failed")
+	}
+	return reply
+}
+
+//UNIX域套接字进行RPC通信的example -- client
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
