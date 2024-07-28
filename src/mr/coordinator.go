@@ -7,10 +7,14 @@ import "net/rpc"
 import "net/http"
 import "time"
 import "sync"
+import "strconv"
+import "fmt"
+import "strings"
 
+var mu sync.Mutex // 定义全局互斥锁，worker访问Master时加锁
 type TaskType int
 const (
-	MapTask TaskType = itoa
+	MapTask TaskType = iota
 	ReduceTask
 )
 
@@ -33,7 +37,7 @@ type Task struct {
 
 type Phase int
 const (
-	MapPhase Phase = Itoa   //map阶段
+	MapPhase Phase = iota   //map阶段
 	ReducePhase             
 	Done                      
 )
@@ -46,39 +50,49 @@ type Coordinator struct {
 	TaskMap               map[int]*Task  //记录所有的task
 	MapperNum             int      //每个文件分给一个map去做
 	ReduceNum             int      //传入的reducer数量，用于hash
-	mu                    sync.Mutex // 添加互斥锁来保护 TaskMap
 }
 
+//定义想通过RPC提供的方法，rpc.Register(c)会将所有方法都注册
+// type CoordinatorRPC interface {
+//     AssignTask(args *TaskArgs, reply *TaskReply) error
+// 	UpdateTaskState(args *FinArgs, reply *FinReply) error
+// }
+
+
 func (c * Coordinator) GenerateTaskId() int {
-	return ++(c.TaskIdForGen)
+	c.TaskIdForGen++
+	return c.TaskIdForGen
 }
 // Your code here -- RPC handlers for the worker to call.
 
 //
 // RPC中暴露给client的方法
 //
-// func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-// 	reply.Y = args.X + 1
-// 	return nil
-// }
+func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
+	reply.Y = args.X + 1
+	return nil
+}
 
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
-	c.mu.Lock()
+	mu.Lock()
 	defer mu.Unlock()
+	log.Printf("master get a request from worker\n")
+
 	switch c.CurrentPhase {
 	case MapPhase:
 		if len(c.MapTaskChannel) > 0 {
 			taskp := <- c.MapTaskChannel
 			if taskp.TaskState == Waiting {
-				reply.Task = *taskp
+				reply.TaskReply = *taskp
 				reply.Answer = TaskGot
-				task.TaskState = Working
-				task.StartTime = time.Now()
-				c.TaskMap[*(taskp).TaskId] = taskp
+				taskp.TaskState = Working
+				taskp.StartTime = time.Now()
+				c.TaskMap[taskp.TaskId] = taskp
 				fmt.Printf("Task[%d] has been assigned\n", taskp.TaskId)
 			}
 		} else {
 			reply.Answer = NoTaskNow
+			log.Printf("no task now")
 			if c.checkMapTaskDone(){
 				c.toNextStage()
 			}
@@ -86,14 +100,15 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 		}
 
 	case ReducePhase:
+		log.Println("reduce phase")
 		if len(c.ReduceTaskChannel) > 0 {
 			taskp := <- c.ReduceTaskChannel
 			if taskp.TaskState == Waiting {
 				reply.Answer = TaskGot
-				reply.Task = *taskp
-				task.TaskState = Working
-				task.StartTime = time.Now()
-				c.TaskMap[*(taskp).TaskId] = taskp
+				reply.TaskReply = *taskp
+				taskp.TaskState = Working
+				taskp.StartTime = time.Now()
+				c.TaskMap[taskp.TaskId] = taskp
 				fmt.Printf("Task[%d] has been assigned\n", taskp.TaskId)
 			}
 		} else {
@@ -106,49 +121,67 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 	
 	case Done:
 		reply.Answer = Finish
-		fmt.Println("all task have been finishe")
+		fmt.Println("all task have been finished")
 	
 	default:
 		fmt.Println("undefined phase")
 	}
+	log.Printf("assign successful")
 	return nil
 }
 
-func (c *Coordinator) UpdateTaskState(args *TaskArgs, reply *TaskReply) error{
-	c.mu.Lock()
+func (c *Coordinator) UpdateTaskState(args *FinArgs, reply *FinReply) error{
+	mu.Lock()
 	defer mu.Unlock()
 	id := args.TaskId
-	fmt.Printf("Task[%d] has been finished\n", id)
-	c.TaskMap[id].TaskState = Finished
-	return nil
+    task, ok := c.TaskMap[id]
+    if !ok {
+        return fmt.Errorf("task with ID %d not found", id)
+    }
+	if args.IsFinished {
+		fmt.Printf("Task[%d] has been finished\n", id)
+		task.TaskState = Finished
+	} else {
+		fmt.Printf("Task[%d] has not been finished, resetting to Waiting\n", id)
+		task.TaskState = Waiting
+		delete(c.TaskMap, task.TaskId)
+		// Optionally, re-enqueue the task
+		if task.TaskType == MapTask{
+			log.Printf("re push task into map channel")
+			c.MapTaskChannel <- task
+		}
+		if task.TaskType == ReduceTask {
+			c.ReduceTaskChannel <- task
+			log.Printf("re push task into reduce channel")
+		}
+	}
+    return nil
 }
 
 //检查task map中所有的map任务是否都完成
 func (c *Coordinator) checkMapTaskDone() bool{
 	count := 0
 	for _, task := range c.TaskMap {
-		if task.TaskType == MapTask && task.TaskState == Finished{
-			count++;
+		if task.TaskType == MapTask{
+			if task.TaskState == Finished{
+				count++
+			}
 		}
 	}
-	if(count == c.MapperNum){
-		return true;
-	}
-	return false;
+	return count == c.MapperNum
 }
 
 //检查task map中所有的reduce任务是否都完成
 func (c *Coordinator) checkReduceTaskDone() bool{
 	count := 0
 	for _, task := range c.TaskMap {
-		if task.TaskType == ReduceTask && task.TaskState == Finished{
-			count++;
+		if task.TaskType == ReduceTask{
+			if task.TaskState == Finished{
+				count++
+			}
 		}
 	}
-	if(count == c.ReduceNum){
-		return true;
-	}
-	return false;
+	return count == c.ReduceNum
 }
 
 func (c *Coordinator) toNextStage(){
@@ -169,6 +202,8 @@ func (c *Coordinator) toNextStage(){
 //基于UNIX域套接字的RPC，使用HTTP协议通信
 func (c *Coordinator) server() {
 	rpc.Register(c)     //注册RPC服务
+	// rpc.RegisterName("AssignTask", CoordinatorRPC(c))
+	// rpc.RegisterName("UpdateTaskState", CoordinatorRPC(c))
 	rpc.HandleHTTP()    //RPC使用HTTP协议处理
 	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
@@ -187,8 +222,8 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	ret := false
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 	
 	if c.CurrentPhase == Done{
 		ret = true
@@ -209,7 +244,7 @@ func (c *Coordinator) MakeMapTask(files []string) {
 			StartTime: time.Now(),
 			InputFile: input,
 			ReduceKth: -1,
-			ReduceNum: c.ReduceNum
+			ReduceNum: c.ReduceNum,
 		}
 		log.Printf("make a map task for file: %s, task id: %d\n", file, id)
 		c.MapTaskChannel <- &mapTask
@@ -227,7 +262,7 @@ func (c *Coordinator) MakeReduceTask(){
 		log.Printf("read dir error, dir: %s, error: %s", dir, err.Error())
 		return
 	}
-	for i:=0; i < c.nReduce; i++ {
+	for i:=0; i < c.ReduceNum; i++ {
 		id := c.GenerateTaskId()
 		var input []string //获取mr-X-Y中，某个Y对应的全部文件（Y就是i）
 		for _, file := range files {
@@ -236,6 +271,7 @@ func (c *Coordinator) MakeReduceTask(){
 				input = append(input, name)
 			}
 		}
+		result := strings.Join(input, ";")
 		reduceTask := Task{
 			TaskId: id,
 			TaskType: ReduceTask,
@@ -245,7 +281,7 @@ func (c *Coordinator) MakeReduceTask(){
 			ReduceKth: i,
 			ReduceNum: c.ReduceNum,
 		}
-		log.Printf("make a map task for file: %s, task id: %d\n", file, id)
+		log.Printf("make a reduce task for file, task id: %d, file name: %s\n", id, result)
 		c.ReduceTaskChannel <- &reduceTask
 	}
 }
@@ -262,13 +298,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		TaskIdForGen: 0,
 		MapTaskChannel: make(chan* Task, len(files)),
 		ReduceTaskChannel: make(chan* Task, nReduce),
-		TaskMap: make(map[int]*Task),
+		TaskMap: make(map[int]*Task, len(files)+nReduce),
 		MapperNum: len(files),
 		ReduceNum: nReduce,
 	}
 
 	//根据files生成map任务
-	m.MakeMapTask(files)
+	c.MakeMapTask(files)
 
 	c.server()
 
@@ -278,28 +314,27 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 //如果worker发生crash（这里假定10秒没完成），会将这个任务重置，删除TaskMap的对应条，然后放入channel中等待下次分配
 func (c *Coordinator) CrashHandle() {
-    ticker := time.NewTicker(2 * time.Second)
     for {
-        select {
-        case <-ticker.C:
-			if c.CurrentPhase == Done {
-				break;
-			}
-          	c.mu.Lock()
-			defer c.mu.Unlock()
-            for _, task := range c.TaskMap {
-				if task.TaskState == Working && time.Now() - task.StartTime > 10 {
-					fmt.Printf("Task[%d] is crashed\n", task.TaskId)
-					task.TaskState = Waiting //更新
-					switch task.TaskType {
-					case MapTask:
-						c.MapTaskChannel <- task
-					case ReduceTask:
-						c.ReduceTaskChannel <- task
-					}
-					delete(c.MakeMapTask, task.taskID)
+		time.Sleep(time.Second)
+        mu.Lock()
+
+		if c.CurrentPhase == Done {
+			mu.Unlock()
+			break
+		}
+		for _, task := range c.TaskMap {
+			if task.TaskState == Working && time.Since(task.StartTime) > 10*time.Second {
+				fmt.Printf("Task[%d] is crashed\n", task.TaskId)
+				task.TaskState = Waiting // 更新状态
+				switch task.TaskType {
+				case MapTask:
+					c.MapTaskChannel <- task
+				case ReduceTask:
+					c.ReduceTaskChannel <- task
 				}
-            }
-        }
+				delete(c.TaskMap, task.TaskId) // 删除taskmap
+			}
+		}
+        mu.Unlock()
     }
 }

@@ -33,7 +33,7 @@ type TaskArgs struct {
 //分别为获取task成功； 暂没有未分配的task; 所有worker任务完成
 type ReplyState int
 const (
-	TaskGot    ReplyState = itoa
+	TaskGot    ReplyState = iota
 	NoTaskNow
 	Finish
 )
@@ -46,6 +46,7 @@ type TaskReply struct {
 //worker完成后告知master更新任务状态，master去修改TaskMap中的任务状态
 type FinArgs struct {
 	TaskId int
+	IsFinished bool  //标记是否完成（可能有异常）
 }
 type FinReply struct {
 

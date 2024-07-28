@@ -5,11 +5,11 @@ import "log"
 import "net/rpc"
 import "hash/fnv"
 import "os"
-import "strings"
-import "bufio"
 import "time"
-
-
+import "io/ioutil"
+import "sort"
+import "strconv"
+import "encoding/json"
 //
 // Map functions return a slice of KeyValue.
 //
@@ -18,6 +18,13 @@ type KeyValue struct {
 	Value string
 }
 
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -33,68 +40,52 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-	
-	while(true) {
-		//发起请求
-		re := CallTask()
-		switch re.Answer {
-		case TaskGot://分到任务
-			task := re.TaskReply
-			switch task {
-			case MapTask:
-				fmt.Println("worker get a map task, task id: %d", task.TaskId)
-				PerformMapTask(mapf, &task)
-				FinshReport(task.TaskId)
-			case ReduceTask:
-				fmt.Println("worker get a reduce task, task id: %d", task.TaskId)
-				PerformReduceTask(reducef, &task)
-				FinshReport(task.TaskId)
-			}
-		}
-		case NoTaskNow: //没获取到任务，等1s后再次请求
-			time.sleep(time.Second)
-		
-		case Finish
-			break;
-		case
-	}
+    reducef func(string, []string) string) {
 
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
+    for {
+		//CallExample()
+		//time.Sleep(time.Second)
+		//os.Exit(0) // 正常退出程序
+        // 发起请求
+        re := CallTask()
+        switch re.Answer {
+        case TaskGot: // 分到任务
+            task := re.TaskReply
+			var err error
+            switch task.TaskType {
+            case MapTask:
+                fmt.Printf("worker get a map task, task id: %d\n", task.TaskId)
+                err = PerformMapTask(mapf, &task)
+				if err != nil{
+                	fmt.Printf("error encountered in map task: %v, requesting new task\n", err)
+                    FinishReport(task.TaskId, false)
+					continue // 发生错误时忽略并继续请求新任务
+				}
+				FinishReport(task.TaskId, true)
+                
+            case ReduceTask:
+                fmt.Printf("worker get a reduce task, task id: %d\n", task.TaskId)
+                err = PerformReduceTask(reducef, &task)
+                if err != nil {
+                    fmt.Printf("error encountered in reduce task: %v, requesting new task\n", err)
+                    FinishReport(task.TaskId, false)
+					continue // 发生错误时忽略并继续请求新任务
+                }
+                FinishReport(task.TaskId, true)
+            }
+        case NoTaskNow: // 没获取到任务，等1s后再次请求
+            time.Sleep(time.Second)
+        case Finish:
+			os.Exit(0)
+        }
+    }
 }
 
 //向master发起RPC请求，获取task
 func CallTask() TaskReply {
 	args := TaskArgs{}
 	reply := TaskReply{}
-
+	log.Printf("try to call task")
 	ok := call("Coordinator.AssignTask", &args, &reply)
 	if !ok {
 		fmt.Println("call rpc assign task failed")
@@ -103,102 +94,126 @@ func CallTask() TaskReply {
 }
 
 //worker完成任务后调RPC告知master，并修改任务状态
-func FinshReport(id int){
-	args := FinArgs{TaskId: id}
+func FinishReport(id int, isFinished bool){
+	args := FinArgs{TaskId: id, IsFinished: isFinished}
 	reply := FinReply{}
 
 	ok := call("Coordinator.UpdateTaskState", &args, &reply)
 	if !ok {
 		fmt.Println("call rpc update task state failed")
 	}
-	return reply
 }
 
 //mapf在wc.go中定义，由于在package main，所以作为参数传入...(不合理的地方)
 //RPC请求获取task后,调用mapf函数然后生成中间文件mr-X-Y
-func PerformMapTask(mapf func(string, string) []KeyValue, task *Task) {
+func PerformMapTask(mapf func(string, string) []KeyValue, task *Task) (err error){
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Printf("Recovered in PerformMapTask: %v\n", r)
+            err = fmt.Errorf("map task failed: %v", r)
+        }
+    }()
+
 	intermediate := []KeyValue{}
+	all_file := ""
 	for _, filename := range task.InputFile {
+		all_file = all_file + filename
+		//log.Printf("perform map task, file: %s", filename)
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
+			return err
 		}
 		content, err := ioutil.ReadAll(file)
 		if err != nil {
 			log.Fatalf("cannot read %v", filename)
+			return err
 		}
 		file.Close()
 		kva := mapf(filename, string(content))
 		intermediate = append(intermediate, kva...)
+		log.Printf("kva size: %d", len(kva))
 	}
+	log.Printf("map task, file name: %s, task id: %d", all_file, task.TaskId)
 	sort.Sort(ByKey(intermediate))
 
 	//中间文件的命名是 mr-X-Y,  X是Map的task id, Y是ihash(key)*
-	count := task.ReduceNum
-	for i:=0;i<count;i++{
+	rn := task.ReduceNum
+
+	// 先创建所有需要的文件，并为每个文件创建一个JSON编码器
+	encoders := make([]*json.Encoder, rn)
+	files := make([]*os.File, rn)
+	
+	for i := 0; i < rn; i++ {
 		midFileName := "mr-" + strconv.Itoa(task.TaskId) + "-" + strconv.Itoa(i)
-		midFile, _:= os.Create(midFileName)
+		file, err := os.Create(midFileName)
+		if err != nil {
+			log.Fatalf("Failed to create file %s: %v", midFileName, err)
+			return err
+		}
+		files[i] = file
+		encoders[i] = json.NewEncoder(file)
 	}
-    fileMap := make(map[int]*bufio.Writer)
-    fileHandles := make(map[int]*os.File)
-
-    for _, word := range intermediate {
-        index := int(ihash(word.Key)) % count
-        midFileName := fmt.Sprintf("mr-%d-%d", taskID, index)
-
-        // 检查是否已经打开了文件
-        if _, ok := fileMap[index]; !ok {
-            file, err := os.OpenFile(midFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-            if err != nil {
-                return err
-            }
-            fileHandles[index] = file
-            fileMap[index] = bufio.NewWriter(file)
-        }
-
-        // 写入数据
-        writer := fileMap[index]
-        _, err := writer.WriteString(fmt.Sprintf("{%s,%d}\n", word.Key, word.Value))
-        if err != nil {
-            return err
-        }
-    }
-
-    // 清理：关闭所有文件
-    for _, writer := range fileMap {
-        writer.Flush()
-    }
-    for _, file := range fileHandles {
-        file.Close()
-    }
+	
+	// 遍历intermediate数组，根据哈希值将每个kv写入对应的文件
+	for _, kv := range intermediate {
+		index := ihash(kv.Key) % rn
+		err := encoders[index].Encode(&kv)
+		if err != nil {
+			log.Fatalf("Failed to encode kv: %v", err)
+			return err
+		}
+	}
+	
+	// 关闭所有文件
+	for _, file := range files {
+		if err := file.Close(); err != nil {
+			log.Fatalf("Failed to close file: %v", err)
+			return err
+		}
+	}
+	return nil
 }
 
 //reduce的工作是读取中间文件的kv，合并后排序
-func PerformReduceTask(mapf func(string, string) []KeyValue, task *Task) {
-
+func PerformReduceTask(reducef func(string, []string) string, task *Task)(err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Printf("Recovered in PerformMapTask: %v\n", r)
+            err = fmt.Errorf("map task failed: %v", r)
+        }
+    }()
 	intermediate := []KeyValue{}
-	oname := "mr-out-" + strconv.Itoa(task.ReduceKth)
-	ofile, _ := os.Create(oname)
 	for _, filename := range task.InputFile{
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
+			return err
 		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			var key string
-			var value int
-			line := scanner.Text()
-			// 去除花括号
-			line = strings.Trim(line, "{}")
-			_, err := fmt.Sscanf(line, "%s,%d", &key, &value)
+		// 反序列化JSON格式文件
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			// func (dec *Decoder) Decode(v interface{}) error
+			// Decode从输入流读取下一个json编码值并保存在v指向的值里
+			err := dec.Decode(&kv)
 			if err != nil {
-				log.Fatalf("fail to parse file %v", filename)
+				break
 			}
-			intermediate = append(intermediate, {key, value})
+			intermediate = append(intermediate, kv) // 将中间文件的每组kv都写入kva
 		}
+		file.Close()
 	}
 	sort.Sort(ByKey(intermediate))
+	//MapReduce论文提到了使用临时文件并在完成写入后原子地重命名它的技巧
+	//确保数据的完整性 -- 只有所有数据都成功写入，才会被重命名为最后的输出文件
+	// 文件重命名是原子操作
+	dir, _ := os.Getwd()
+	tmpfile, err := os.CreateTemp(dir, "mr-out-tmpfile-")
+	if err != nil {
+		log.Fatal("failed to create temp file", err)
+		return err
+	}
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -212,11 +227,14 @@ func PerformReduceTask(mapf func(string, string) []KeyValue, task *Task) {
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(tmpfile, "%v %v\n", intermediate[i].Key, output)
 
 		i = j
 	}
-	ofile.Close()
+	tmpfile.Close()
+	oname := "mr-out-" + strconv.Itoa(task.ReduceKth)
+	os.Rename(dir+tmpfile.Name(), dir+oname)
+	return nil
 }
 
 //UNIX域套接字进行RPC通信的example -- client
@@ -233,7 +251,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
-	fmt.Println(err)
+	log.Printf("call failed: %s", err.Error())
+	//fmt.Println(err)
 	return false
 }
